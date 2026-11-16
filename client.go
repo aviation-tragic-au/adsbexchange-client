@@ -12,394 +12,267 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package adsbexchange is a client for ADS-B Exchange's API on RapidAPI,
+// returning aircraft in readsb's v2 format (the adsbv2 module).
 package adsbexchange
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	"io"
+	"math"
 	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
-	"github.com/spf13/viper"
+	"github.com/aviation-tragic-au/adsbv2"
 	"go.uber.org/zap"
 )
 
 const (
-	Namespace          = "feed.adsbexchange"
-	headerContentType  = "Content-Type"
+	// DefaultHost is ADS-B Exchange's RapidAPI host, used when Config.Host
+	// is empty.
+	DefaultHost = "adsbexchange-com1.p.rapidapi.com"
+
+	// DefaultTimeout bounds a request when Config.HTTPClient is unset.
+	DefaultTimeout = 10 * time.Second
+
+	// MaxDistNM is the largest radius GetAircraftWithinRange accepts.
+	MaxDistNM = 250
+
 	headerRapidAPIKey  = "X-RapidAPI-Key"
 	headerRapidAPIHost = "X-RapidAPI-Host"
+
+	headerQuotaLimit     = "X-RateLimit-Requests-Limit"
+	headerQuotaRemaining = "X-RateLimit-Requests-Remaining"
 )
 
-// BindEnvs registers environment variable mappings for this feed's config namespace.
-func BindEnvs(v *viper.Viper) {
-	_ = v.BindEnv("feed.adsbexchange.host", "FEED_ADSBEXCHANGE_HOST")
-	_ = v.BindEnv("feed.adsbexchange.key", "FEED_ADSBEXCHANGE_KEY")
-}
+var (
+	// ErrNotFound is returned by the single-aircraft lookups when ADS-B
+	// Exchange has no aircraft for the code.
+	ErrNotFound = errors.New("adsbexchange: aircraft not found")
 
-// Client represents a client for the ADS-B Exchange API
+	// ErrRateLimited matches, under errors.Is, a 429 from RapidAPI. The
+	// error is an *adsbv2.RateLimitError carrying the Retry-After delay.
+	ErrRateLimited = adsbv2.ErrRateLimited
+
+	squawkPattern = regexp.MustCompile(`^[0-7]{4}$`)
+)
+
+// Client is a client for ADS-B Exchange's API. It is safe for concurrent
+// use. Every request counts against the RapidAPI plan's allowance; see
+// Quota.
 type Client struct {
-	logger *zap.Logger
+	logger     *zap.Logger
+	httpClient *http.Client
+	key        func() string
+	url        string
+	host       string
 
-	URL  string
-	Host string
-	Key  string
+	quota atomic.Pointer[Quota]
 }
 
-// NewClient creates a new ADS-B Exchange client
-func NewClient(logger *zap.Logger, cfg *Config) (*Client, error) {
-	if cfg.Host == "" || cfg.Key == "" {
-		return nil, errors.New("adsbexchange host and key must be set")
+// NewClient creates an ADS-B Exchange client. A nil logger logs nothing.
+func NewClient(logger *zap.Logger, cfg Config) (*Client, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	host := cfg.Host
+	if host == "" {
+		host = DefaultHost
+	}
+
+	base := strings.TrimRight(cfg.URL, "/")
+	if base == "" {
+		base = "https://" + host + "/v2"
+	}
+	if _, err := url.Parse(base); err != nil {
+		return nil, fmt.Errorf("adsbexchange: invalid URL: %w", err)
+	}
+
+	key := cfg.KeyFunc
+	if key == nil {
+		static := cfg.Key
+		key = func() string { return static }
+	}
+
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: DefaultTimeout}
 	}
 
 	return &Client{
-		logger: logger.Named(Namespace),
-		Host:   cfg.Host,
-		Key:    cfg.Key,
-		URL:    fmt.Sprintf("https://%s/v2", cfg.Host),
+		logger:     logger.Named("adsbexchange"),
+		httpClient: httpClient,
+		key:        key,
+		url:        base,
+		host:       host,
 	}, nil
 }
 
-func (c *Client) Endpoints() map[string]string {
-	return map[string]string{
-		"aircraft_by_callsign":     "/callsign/{callsign}/",
-		"aircraft_by_hex":          "/hex/{hex}",
-		"aircraft_by_icao":         "/icao/{hex}/",
-		"aircraft_by_registration": "/registration/{registration}/",
-		"aircraft_by_squawk":       "/sqk/{squawk}/",
-		"aircraft_military":        "/mil/",
-		"aircraft_within_range":    "/lat/{lat}/lon/{lon}/dist/{dist}/",
-	}
+// Quota returns the plan allowance RapidAPI reported on the latest
+// response that carried it, or nil before any has.
+func (c *Client) Quota() *Quota {
+	return c.quota.Load()
 }
 
-// doRequest builds, executes, and reads the body for a given path.
-func (c *Client) doRequest(path string) ([]byte, error) {
-	req, err := c.getRequest(path)
-	if err != nil {
-		return nil, err
+// GetAircraftWithinRange returns every aircraft within distNM nautical
+// miles (1 to MaxDistNM) of lat/lon, with RapidAPI's quota headers when
+// sent. The quota comes back even when the request failed (a 429, say), so
+// a caller can meter its usage either way.
+func (c *Client) GetAircraftWithinRange(ctx context.Context, lat, lon float64, distNM int) ([]*Aircraft, *Quota, error) {
+	if !valid(lat, 90) || !valid(lon, 180) {
+		return nil, nil, fmt.Errorf("adsbexchange: invalid coordinates %v,%v", lat, lon)
+	}
+	if distNM <= 0 || distNM > MaxDistNM {
+		return nil, nil, fmt.Errorf("adsbexchange: distance must be 1-%d nm, got %d", MaxDistNM, distNM)
 	}
 
-	c.logger.Debug("making request", zap.String("url", req.URL.String()))
-
-	resp, err := http.DefaultClient.Do(req)
+	out, quota, err := c.query(ctx, fmt.Sprintf("/lat/%.5f/lon/%.5f/dist/%d/", lat, lon, distNM))
 	if err != nil {
-		c.logger.Error("error making request", zap.Error(err))
-		return nil, err
+		return nil, quota, err
 	}
-	defer closeResponseBody(resp.Body, c.logger)
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c.logger.Error("error reading response body", zap.Error(err))
-		return nil, err
-	}
-
-	return body, nil
+	return out.Aircraft, quota, nil
 }
 
-// fetchResult executes a request and unmarshals the body into a Result,
-// returning the filtered aircraft slice.
-func (c *Client) fetchResult(path string) ([]*Aircraft, error) {
-	body, err := c.doRequest(path)
+// GetMilitaryAircraft returns every aircraft the database marks as
+// military.
+func (c *Client) GetMilitaryAircraft(ctx context.Context) ([]*Aircraft, error) {
+	out, _, err := c.query(ctx, "/mil/")
 	if err != nil {
 		return nil, err
 	}
-
-	var result Result
-	if err := json.Unmarshal(body, &result); err != nil {
-		c.logger.Error("error unmarshalling response body", zap.Error(err))
-		return nil, err
-	}
-
-	return c.filterADSBICAO(result.Aircraft), nil
+	return out.Aircraft, nil
 }
 
-// fetchAircraft executes a request and unmarshals the body into a single Aircraft.
-func (c *Client) fetchAircraft(path string) (*Aircraft, error) {
-	body, err := c.doRequest(path)
+// GetAircraftBySquawk returns the aircraft squawking a code: four octal
+// digits, as a string so a leading zero ("0123") survives.
+func (c *Client) GetAircraftBySquawk(ctx context.Context, squawk string) ([]*Aircraft, error) {
+	if !squawkPattern.MatchString(squawk) {
+		return nil, fmt.Errorf("adsbexchange: invalid squawk %q", squawk)
+	}
+
+	out, _, err := c.query(ctx, "/sqk/"+squawk+"/")
 	if err != nil {
 		return nil, err
 	}
-
-	var aircraft Aircraft
-	if err := json.Unmarshal(body, &aircraft); err != nil {
-		c.logger.Error("error unmarshalling response body", zap.Error(err))
-		return nil, err
-	}
-
-	return &aircraft, nil
+	return out.Aircraft, nil
 }
 
-// GetMilitaryAircraft returns all military aircraft
-func (c *Client) GetMilitaryAircraft() ([]*Aircraft, error) {
-	req, err := c.getRequest(c.Endpoints()["aircraft_military"])
-	if err != nil {
-		return nil, err
-	}
-
-	c.logger.Debug("making request", zap.String("url", req.URL.String()))
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		c.logger.Error("error making request", zap.Error(err))
-		return nil, err
-	}
-	defer closeResponseBody(response.Body, c.logger)
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		c.logger.Error("error reading response body", zap.Error(err))
-	}
-	var result Result
-	if err := json.Unmarshal(body, &result); err != nil {
-		c.logger.Error("error unmarshaling response body", zap.Error(err))
-		return nil, err
-	}
-	return c.filterADSBICAO(result.Aircraft), nil
+// GetAircraftByCallsign returns the aircraft using a callsign, or
+// ErrNotFound.
+func (c *Client) GetAircraftByCallsign(ctx context.Context, callsign string) (*Aircraft, error) {
+	return c.lookup(ctx, "callsign", strings.ToUpper(strings.TrimSpace(callsign)))
 }
 
-// GetAircraftBySquawk returns aircraft by squawk
-func (c *Client) GetAircraftBySquawk(squawk int) ([]*Aircraft, error) {
-	path := c.Endpoints()["aircraft_by_squawk"]
-	path = strings.Replace(path, "{squawk}", fmt.Sprintf("%d", squawk), 1)
-	req, err := c.getRequest(path)
-	if err != nil {
-		return nil, err
-	}
-
-	c.logger.Debug("making request", zap.String("url", req.URL.String()))
-	response, err := http.DefaultClient.Do(req)
-
-	if err != nil {
-		c.logger.Error("error making request", zap.Error(err))
-		return nil, err
-	}
-
-	defer closeResponseBody(response.Body, c.logger)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		c.logger.Error("error reading response body", zap.Error(err))
-	}
-
-	var result Result
-	if err := json.Unmarshal(body, &result); err != nil {
-		c.logger.Error("error unmarshalling response body", zap.Error(err))
-		return nil, err
-	}
-
-	return c.filterADSBICAO(result.Aircraft), nil
+// GetAircraftByHex returns the aircraft with a 24-bit ICAO address in hex
+// ("7c6b2d"), or ErrNotFound.
+func (c *Client) GetAircraftByHex(ctx context.Context, hex string) (*Aircraft, error) {
+	return c.lookup(ctx, "hex", strings.ToLower(strings.TrimSpace(hex)))
 }
 
-// GetAircraftByCallsign returns aircraft by callsign
-func (c *Client) GetAircraftByCallsign(callsign string) (*Aircraft, error) {
-	path := c.Endpoints()["aircraft_by_callsign"]
-	path = strings.Replace(path, "{callsign}", callsign, 1)
-	req, err := c.getRequest(path)
-	if err != nil {
-		return nil, err
-	}
-
-	c.logger.Debug("making request", zap.String("url", req.URL.String()))
-	response, err := http.DefaultClient.Do(req)
-
-	if err != nil {
-		c.logger.Error("error making request", zap.Error(err))
-		return nil, err
-	}
-
-	defer closeResponseBody(response.Body, c.logger)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		c.logger.Error("error reading response body", zap.Error(err))
-	}
-
-	var aircraft Aircraft
-	if err := json.Unmarshal(body, &aircraft); err != nil {
-		c.logger.Error("error unmarshalling response body", zap.Error(err))
-		return nil, err
-	}
-
-	return &aircraft, nil
+// GetAircraftByICAO returns the aircraft with a 24-bit ICAO address, or
+// ErrNotFound. ADS-B Exchange serves it as an alias of GetAircraftByHex.
+func (c *Client) GetAircraftByICAO(ctx context.Context, icao string) (*Aircraft, error) {
+	return c.lookup(ctx, "icao", strings.ToLower(strings.TrimSpace(icao)))
 }
 
-// GetAircraftByHex returns aircraft by hex
-func (c *Client) GetAircraftByHex(hex string) (*Aircraft, error) {
-	path := c.Endpoints()["aircraft_by_hex"]
-	path = strings.Replace(path, "{hex}", hex, 1)
-	req, err := c.getRequest(path)
-	if err != nil {
-		return nil, err
-	}
-
-	c.logger.Debug("making request", zap.String("url", req.URL.String()))
-	response, err := http.DefaultClient.Do(req)
-
-	if err != nil {
-		c.logger.Error("error making request", zap.Error(err))
-		return nil, err
-	}
-
-	defer closeResponseBody(response.Body, c.logger)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		c.logger.Error("error reading response body", zap.Error(err))
-	}
-
-	var aircraft Aircraft
-	if err := json.Unmarshal(body, &aircraft); err != nil {
-		c.logger.Error("error unmarshalling response body", zap.Error(err))
-		return nil, err
-	}
-
-	return &aircraft, nil
+// GetAircraftByRegistration returns the aircraft with a registration
+// ("VH-VZS"), or ErrNotFound.
+func (c *Client) GetAircraftByRegistration(ctx context.Context, registration string) (*Aircraft, error) {
+	return c.lookup(ctx, "registration", strings.ToUpper(strings.TrimSpace(registration)))
 }
 
-// GetAircraftByICAO returns aircraft by ICAO
-func (c *Client) GetAircraftByICAO(icao string) (*Aircraft, error) {
-	path := c.Endpoints()["aircraft_by_icao"]
-	path = strings.Replace(path, "{icao}", icao, 1)
-	req, err := c.getRequest(path)
-	if err != nil {
-		return nil, err
-	}
-
-	c.logger.Debug("making request", zap.String("url", req.URL.String()))
-	response, err := http.DefaultClient.Do(req)
-
-	if err != nil {
-		c.logger.Error("error making request", zap.Error(err))
-		return nil, err
-	}
-
-	defer closeResponseBody(response.Body, c.logger)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		c.logger.Error("error reading response body", zap.Error(err))
-	}
-
-	var aircraft Aircraft
-	if err := json.Unmarshal(body, &aircraft); err != nil {
-		c.logger.Error("error unmarshalling response body", zap.Error(err))
-		return nil, err
-	}
-
-	return &aircraft, nil
-}
-
-// GetAircraftByRegistration returns aircraft by registration
-func (c *Client) GetAircraftByRegistration(registration string) (*Aircraft, error) {
-	path := c.Endpoints()["aircraft_by_registration"]
-	path = strings.Replace(path, "{registration}", registration, 1)
-	req, err := c.getRequest(path)
-	if err != nil {
-		return nil, err
-	}
-
-	c.logger.Debug("making request", zap.String("url", req.URL.String()))
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		c.logger.Error("error making request", zap.Error(err))
-		return nil, err
-	}
-
-	defer closeResponseBody(response.Body, c.logger)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		c.logger.Error("error reading response body", zap.Error(err))
-	}
-
-	var aircraft Aircraft
-	if err := json.Unmarshal(body, &aircraft); err != nil {
-		c.logger.Error("error unmarshalling response body", zap.Error(err))
-	}
-	return &aircraft, nil
-}
-
-// GetAircraftWithinRange returns aircraft within a given distance from a given latitude and longitude
-func (c *Client) GetAircraftWithinRange(
-	lat float64,
-	lon float64,
-	dist int64,
-) ([]*Aircraft, error) {
-	path := c.Endpoints()["aircraft_within_range"]
-	path = strings.Replace(path, "{lat}", fmt.Sprintf("%f", lat), 1)
-	path = strings.Replace(path, "{lon}", fmt.Sprintf("%f", lon), 1)
-	path = strings.Replace(path, "{dist}", fmt.Sprintf("%d", dist), 1)
-	req, err := c.getRequest(path)
-	if err != nil {
-		return nil, err
-	}
-
-	c.logger.Debug("making request", zap.String("url", req.URL.String()))
-	response, err := http.DefaultClient.Do(req)
-
-	if err != nil {
-		c.logger.Error("error making request", zap.Error(err))
-		return nil, err
-	}
-
-	defer closeResponseBody(response.Body, c.logger)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		c.logger.Error("error reading response body", zap.Error(err))
-		return nil, err
-	}
-
-	var result Result
-	if err := json.Unmarshal(body, &result); err != nil {
-		c.logger.Error("error unmarshaling response body", zap.Error(err))
-		return nil, err
-	}
-
-	return c.filterADSBICAO(result.Aircraft), nil
-}
-
-// filterADSBICAO filters out aircraft without record type 'adsb_icao'
-func (c *Client) filterADSBICAO(aircraft []*Aircraft) []*Aircraft {
-	c.logger.Debug("filtering aircraft without record type 'adsb_icao' or 'mlat'")
-
-	var filtered []*Aircraft
-
+// FilterRecordTypes returns the aircraft whose RecordType is one of types,
+// such as adsbv2.RecordTypeADSBICAO and adsbv2.RecordTypeMLAT to keep only
+// transponder and multilateration positions.
+func FilterRecordTypes(aircraft []*Aircraft, types ...string) []*Aircraft {
+	var out []*Aircraft
 	for _, ac := range aircraft {
-		if ac.RecordType != RecordTypeADSBICAO && ac.RecordType != RecordTypeMLAT {
-			continue
+		for _, t := range types {
+			if ac.RecordType == t {
+				out = append(out, ac)
+				break
+			}
 		}
-
-		ac.Flight = trimWhitespace(ac.Flight)
-		filtered = append(filtered, ac)
 	}
-
-	return filtered
+	return out
 }
 
-func (c *Client) getRequest(path string) (*http.Request, error) {
-	requestURL := fmt.Sprintf("%s%s", c.URL, path)
-	req, err := http.NewRequest("GET", requestURL, nil)
+// lookup fetches /<kind>/<code>/ and returns its first aircraft. ADS-B
+// Exchange wraps even a single aircraft in the {"ac": [...]} envelope.
+func (c *Client) lookup(ctx context.Context, kind, code string) (*Aircraft, error) {
+	if code == "" {
+		return nil, fmt.Errorf("adsbexchange: a %s is required", kind)
+	}
 
+	out, _, err := c.query(ctx, "/"+kind+"/"+url.PathEscape(code)+"/")
 	if err != nil {
-		return nil, fmt.Errorf("unable to create request: %w", err)
+		return nil, err
 	}
-
-	req.Header.Add(headerRapidAPIKey, c.Key)
-	req.Header.Add(headerRapidAPIHost, c.Host)
-	req.Header.Add(headerContentType, "application/json")
-	return req, nil
+	if len(out.Aircraft) == 0 || out.Aircraft[0] == nil {
+		return nil, ErrNotFound
+	}
+	return out.Aircraft[0], nil
 }
 
-// trimWhitespace trims whitespace from a string
-func trimWhitespace(input string) string {
-	return strings.TrimSpace(input)
+// query sends a GET for path and decodes the v2 envelope, recording the
+// quota headers whatever the outcome.
+func (c *Client) query(ctx context.Context, path string) (*Response, *Quota, error) {
+	key := c.key()
+	if key == "" {
+		return nil, nil, errors.New("adsbexchange: no API key set")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+path, http.NoBody)
+	if err != nil {
+		return nil, nil, fmt.Errorf("adsbexchange: unable to build request: %w", err)
+	}
+	req.Header.Set(headerRapidAPIKey, key)
+	req.Header.Set(headerRapidAPIHost, c.host)
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("adsbexchange: request failed: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	quota := readQuota(res.Header)
+	if quota != nil {
+		c.quota.Store(quota)
+	}
+
+	out, err := adsbv2.Decode(res)
+	if err != nil {
+		c.logger.Debug("request failed", zap.String("path", path), zap.Error(err))
+		return nil, quota, fmt.Errorf("adsbexchange: %w", err)
+	}
+
+	return out, quota, nil
 }
 
-// closeResponseBody closes the response body
-func closeResponseBody(body io.ReadCloser, logger *zap.Logger) {
-	if err := body.Close(); err != nil {
-		logger.Error("error closing response body", zap.Error(err))
+func readQuota(h http.Header) *Quota {
+	q := &Quota{Limit: headerInt(h, headerQuotaLimit), Remaining: headerInt(h, headerQuotaRemaining)}
+	if q.Limit == nil && q.Remaining == nil {
+		return nil
 	}
+	return q
+}
+
+func headerInt(h http.Header, name string) *int {
+	v, err := strconv.Atoi(strings.TrimSpace(h.Get(name)))
+	if err != nil {
+		return nil
+	}
+	return &v
+}
+
+// valid reports whether v is a finite number within ±limit.
+func valid(v, limit float64) bool {
+	return !math.IsNaN(v) && v >= -limit && v <= limit
 }
