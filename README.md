@@ -6,83 +6,100 @@ Provides a client for the Community API provided by ADSB Exchange. This will not
 
 https://rapidapi.com/adsbx/api/adsbexchange-com1
 
-## Usage
+## Install
 
-### Configuration
-
-The client is configured via [Viper](https://github.com/spf13/viper), which supports both a `config.json` file and environment variables.
-
-#### config.json
-
-```json
-{
-  "feed": {
-    "adsbexchange": {
-      "host": "adsbexchange-com1.p.rapidapi.com",
-      "key": "your-rapidapi-key"
-    }
-  }
-}
+```sh
+go get github.com/aviation-tragic-au/adsbexchange-client
 ```
 
-#### Environment Variables
-
-| Variable                  | Description                |
-|---------------------------|----------------------------|
-| `FEED_ADSBEXCHANGE_HOST`  | RapidAPI host for the feed |
-| `FEED_ADSBEXCHANGE_KEY`   | RapidAPI key               |
-
-### Example
+## Usage
 
 ```go
 package main
 
 import (
+    "context"
+    "errors"
     "fmt"
     "log"
 
     adsbexchange "github.com/aviation-tragic-au/adsbexchange-client"
-    "github.com/spf13/viper"
     "go.uber.org/zap"
 )
 
 func main() {
-    v := viper.New()
-    v.SetConfigName("config")
-    v.SetConfigType("json")
-    v.AddConfigPath(".")
-
-    // Register environment variable bindings
-    adsbexchange.BindEnvs(v)
-
-    // Read config.json if present; environment variables are always checked
-    if err := v.ReadInConfig(); err != nil {
-        if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-            log.Fatalf("error reading config: %v", err)
-        }
-    }
-
-    var cfg adsbexchange.Config
-    if err := v.UnmarshalKey("feed.adsbexchange", &cfg); err != nil {
-        log.Fatalf("error unmarshalling config: %v", err)
-    }
-
     logger, _ := zap.NewProduction()
-    client, err := adsbexchange.NewClient(logger, &cfg)
+
+    client, err := adsbexchange.NewClient(logger, adsbexchange.Config{
+        Key: "your-rapidapi-key",
+    })
     if err != nil {
-        log.Fatalf("error creating client: %v", err)
+        log.Fatal(err)
     }
 
-    aircraft, err := client.GetMilitaryAircraft()
+    // Everything within 25 nm of Brisbane Airport, and the plan allowance
+    // RapidAPI reported with it
+    aircraft, quota, err := client.GetAircraftWithinRange(context.Background(), -27.3842, 153.1175, 25)
+    if errors.Is(err, adsbexchange.ErrRateLimited) {
+        log.Fatal("over the plan's allowance")
+    }
     if err != nil {
-        log.Fatalf("error fetching aircraft: %v", err)
+        log.Fatal(err)
+    }
+    if quota != nil && quota.Remaining != nil {
+        log.Printf("%d requests left", *quota.Remaining)
     }
 
     for _, ac := range aircraft {
-        fmt.Printf("Flight: %s, Hex: %s\n", ac.Flight, ac.Hex)
+        feet, onGround := ac.Altitude()
+        switch {
+        case onGround:
+            fmt.Printf("%s (%s) on the ground\n", ac.Callsign(), ac.Hex)
+        case feet != nil:
+            fmt.Printf("%s (%s) at %d ft\n", ac.Callsign(), ac.Hex, *feet)
+        }
     }
 }
 ```
+
+Aircraft are [`adsbv2.Aircraft`](https://github.com/aviation-tragic-au/adsbv2),
+readsb's v2 format, shared with the clients for the other readsb-based
+sources.
+
+### Methods
+
+Every method takes a `context.Context` first.
+
+| Method | Returns |
+|---|---|
+| `GetAircraftWithinRange(ctx, lat, lon, distNM)` | Every aircraft within 1 to 250 nm, and the quota |
+| `GetMilitaryAircraft(ctx)` | Aircraft the database marks as military |
+| `GetAircraftBySquawk(ctx, squawk)` | Aircraft squawking a code (four octal digits, as a string) |
+| `GetAircraftByCallsign(ctx, callsign)` | One aircraft, or `ErrNotFound` |
+| `GetAircraftByHex(ctx, hex)` / `GetAircraftByICAO(ctx, icao)` | One aircraft by 24-bit address, or `ErrNotFound` |
+| `GetAircraftByRegistration(ctx, registration)` | One aircraft, or `ErrNotFound` |
+| `Quota()` | The allowance RapidAPI reported on the latest response |
+
+Results include every record type. `FilterRecordTypes(aircraft,
+adsbv2.RecordTypeADSBICAO, adsbv2.RecordTypeMLAT)` keeps just transponder
+and multilateration positions.
+
+A 429 matches `ErrRateLimited` (it's an `*adsbv2.RateLimitError` with the
+`Retry-After` delay); any other non-200 is an `*adsbv2.StatusError`.
+
+### Configuration
+
+| Field        | Description |
+|--------------|-------------|
+| `Key`        | Your RapidAPI key |
+| `KeyFunc`    | Called on every request in place of `Key`, to pick up a key changed at runtime |
+| `Host`       | RapidAPI host, sent as `X-RapidAPI-Host` (default `adsbexchange-com1.p.rapidapi.com`) |
+| `URL`        | API base (default `https://<Host>/v2`) |
+| `HTTPClient` | Your own `*http.Client` (the default times out after 10 seconds) |
+
+`Config` carries `json` and `mapstructure` tags, so it can be decoded
+straight from a config file or Viper; the client itself doesn't depend on
+either.
 
 ## Contributing
 
