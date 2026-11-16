@@ -1,4 +1,4 @@
-module github.com/deanstalker-stream/adsbexchange-client
+module github.com/aviation-tragic-au/adsbexchange-client
 
 go 1.26.2
 
