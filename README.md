@@ -1,6 +1,6 @@
 # adsbexchange-client
 
-[![Lint](https://github.com/deanstalker-stream/adsbexchange-client/actions/workflows/lint.yml/badge.svg)](https://github.com/deanstalker-stream/adsbexchange-client/actions/workflows/lint.yml) [![Test](https://github.com/deanstalker-stream/adsbexchange-client/actions/workflows/test.yml/badge.svg)](https://github.com/deanstalker-stream/adsbexchange-client/actions/workflows/test.yml)
+[![Lint](https://github.com/aviation-tragic-au/adsbexchange-client/actions/workflows/lint.yml/badge.svg)](https://github.com/aviation-tragic-au/adsbexchange-client/actions/workflows/lint.yml) [![Test](https://github.com/aviation-tragic-au/adsbexchange-client/actions/workflows/test.yml/badge.svg)](https://github.com/aviation-tragic-au/adsbexchange-client/actions/workflows/test.yml)
 
 Provides a client for the Community API provided by ADSB Exchange. This will not work for their Commercial API.
 
@@ -41,7 +41,7 @@ import (
     "fmt"
     "log"
 
-    adsbexchange "github.com/deanstalker-stream/adsbexchange-client"
+    adsbexchange "github.com/aviation-tragic-au/adsbexchange-client"
     "github.com/spf13/viper"
     "go.uber.org/zap"
 )
